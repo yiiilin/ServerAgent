@@ -1,4 +1,4 @@
-use tonic::transport::Server;
+use tonic::transport::{Server, ServerTlsConfig};
 use tonic::{Request, Response, Status, Streaming};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -6,6 +6,11 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 use std::time::Duration;
 use tokio::time::sleep;
+use std::fs::File;
+use std::io::BufReader;
+use rustls_pemfile::{certs, pkcs8_private_keys};
+use rustls::{Certificate, PrivateKey, ServerConfig};
+use std::env;
 
 // 导入生成的gRPC代码
 use server_agent::server_agent_service_server::{ServerAgentService, ServerAgentServiceServer};
@@ -53,7 +58,7 @@ impl CommandResultStore {
 struct ServerState {
     clients: Mutex<HashMap<String, ClientState>>,
     token_whitelist: Vec<String>,
-    command_results: Mutex<CommandResultStore>,
+    command_results: CommandResultStore,
 }
 
 impl ServerState {
@@ -95,9 +100,8 @@ impl ServerState {
     }
     
     // 存储命令结果
-    fn store_command_result(&self, command_id: String, result: CommandReply) {
-        let mut command_results = self.command_results.lock().unwrap();
-        command_results.store_result(command_id, result);
+    fn store_command_result(&mut self, command_id: String, result: CommandReply) {
+        self.command_results.store_result(command_id, result);
     }
 }
 
@@ -136,7 +140,21 @@ impl ServerAgentService for Arc<ServerState> {
         log::info!("Client connected successfully: {}", connect_request.client_id);
         
         // 创建响应流
-        Ok(Response::new(command_receiver))
+        let response = Ok(Response::new(command_receiver));
+
+        // 当连接关闭时清理客户端状态
+        tokio::spawn({ 
+            let server_state = self.clone();
+            let client_id = connect_request.client_id.clone();
+            async move {
+                // 等待流结束
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                server_state.remove_client(&client_id);
+                log::info!("Client disconnected: {}", client_id);
+            }
+        });
+
+        response
     }
     
     // 处理客户端状态报告
@@ -187,6 +205,14 @@ impl ServerAgentService for Arc<ServerState> {
         
         Ok(Response::new(Empty {}))
     }
+    
+    // 处理Ping请求用于延迟测量
+    async fn ping(
+        &self,
+        _request: Request<Empty>,
+    ) -> Result<Response<Empty>, Status> {
+        Ok(Response::new(Empty {}))
+    }
 }
 
 #[tokio::main]
@@ -194,8 +220,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
     log::info!("Starting ServerAgent server...");
     
-    // 从环境变量或配置文件加载允许的token列表
-    let token_whitelist = vec!["valid_token_123".to_string()]; // 在实际应用中应该从安全的地方加载
+    // 从环境变量加载允许的token列表
+    dotenv::dotenv().ok();
+    let token_whitelist = std::env::var("TOKEN_WHITELIST")
+        .unwrap_or_else(|_| "valid_token_123".to_string())
+        .split(',')
+        .map(|s| s.to_string())
+        .collect();
     
     // 创建服务状态
     let server_state = Arc::new(ServerState::new(token_whitelist));
@@ -209,7 +240,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // 在后台启动服务器
     tokio::spawn(async move {
+        // 加载TLS证书和私钥
+        let cert_file = File::open("server.pem").expect("Failed to open certificate file");
+        let key_file = File::open("server-key.pem").expect("Failed to open private key file");
+
+        let cert_chain = certs(&mut BufReader::new(cert_file))
+            .expect("Failed to read certificate chain")
+            .into_iter()
+            .map(|cert| rustls::Certificate(cert))
+            .collect();
+
+        let mut keys = pkcs8_private_keys(&mut BufReader::new(key_file))
+            .expect("Failed to read private key")
+            .into_iter()
+            .map(|key| rustls::PrivateKey(key))
+            .collect::<Vec<_>>();
+
+        if keys.is_empty() {
+            panic!("No private keys found in key file");
+        }
+
+        let tls_config = ServerTlsConfig::builder()
+            .identity(rustls::ServerConfig::builder()
+                .with_safe_defaults()
+                .with_no_client_auth()
+                .with_single_cert(cert_chain, keys.remove(0))
+                .expect("Failed to create server TLS configuration"))
+            .into();
+
         Server::builder()
+            .tls_config(tls_config)
+            .expect("Failed to configure TLS")
             .add_service(server)
             .serve(addr)
             .await.expect("Server failed to start");

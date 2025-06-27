@@ -126,11 +126,14 @@ fn get_os_info() -> Result<String, Box<dyn std::error::Error>> {
 
 // 上报客户端状态
 async fn report_status(client: &mut ServerAgentServiceClient<Channel>) -> Result<(), Box<dyn std::error::Error>> {
-    let start_time = Instant::now();
-
     // 收集系统信息
     let hardware = collect_hardware_info()?;
     let network = collect_network_info()?;
+
+    // 测量网络延迟
+    let start_time = Instant::now();
+    let ping_request = Request::new(Empty {});
+    client.ping(ping_request).await?;
     let latency = start_time.elapsed().as_secs_f64() * 1000.0; // 转换为毫秒
 
     let status_report = StatusReport {

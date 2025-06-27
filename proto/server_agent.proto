@@ -12,6 +12,9 @@ service ServerAgentService {
   
   // 执行命令后的响应
   rpc CommandResponse (CommandReply) returns (Empty);
+
+  // 测量网络延迟
+  rpc Ping (Empty) returns (Empty);
 }
 
 // 连接请求（握手）
