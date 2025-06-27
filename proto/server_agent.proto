@@ -1,0 +1,101 @@
+syntax = "proto3";
+
+package server_agent;
+
+// 定义服务接口
+service ServerAgentService {
+  // 客户端连接服务端的握手方法
+  rpc Connect (ConnectRequest) returns (stream CommandRequest);
+  
+  // 客户端上报状态信息
+  rpc ReportStatus (StatusReport) returns (StatusResponse);
+  
+  // 执行命令后的响应
+  rpc CommandResponse (CommandReply) returns (Empty);
+}
+
+// 连接请求（握手）
+message ConnectRequest {
+  string token = 1;          // 客户端token
+  string client_id = 2;      // 客户端ID
+  string hostname = 3;       // 客户端主机名
+  string os = 4;             // 操作系统
+  string version = 5;        // 客户端版本
+}
+
+// 命令请求
+message CommandRequest {
+  string command_id = 1;     // 命令ID
+  string command = 2;        // 命令内容
+  bool interactive = 3;      // 是否交互式命令
+}
+
+// 命令响应
+message CommandReply {
+  string command_id = 1;     // 对应命令ID
+  int32 exit_code = 2;       // 退出码
+  string stdout = 3;         // 标准输出
+  string stderr = 4;         // 错误输出
+  bool completed = 5;        // 是否完成
+}
+
+// 状态报告
+message StatusReport {
+  string client_id = 1;      // 客户端ID
+  double timestamp = 2;      // 时间戳
+  HardwareInfo hardware = 3; // 硬件信息
+  NetworkInfo network = 4;   // 网络信息
+  double latency = 5;        // 与服务端延迟(毫秒)
+}
+
+// 硬件信息
+message HardwareInfo {
+  CpuInfo cpu = 1;           // CPU信息
+  MemoryInfo memory = 2;     // 内存信息
+  DiskInfo disk = 3;         // 磁盘信息
+}
+
+// CPU信息
+message CpuInfo {
+  string model = 1;          // CPU型号
+  int32 cores = 2;           // 核心数
+  double usage = 3;          // 使用率(%)
+  double load_avg_1 = 4;     // 1分钟负载
+  double load_avg_5 = 5;     // 5分钟负载
+  double load_avg_15 = 6;    // 15分钟负载
+}
+
+// 内存信息
+message MemoryInfo {
+  uint64 total = 1;          // 总内存(字节)
+  uint64 used = 2;           // 使用内存(字节)
+  uint64 free = 3;           // 空闲内存(字节)
+  double usage = 4;          // 使用率(%)
+}
+
+// 磁盘信息
+message DiskInfo {
+  uint64 total = 1;          // 总容量(字节)
+  uint64 used = 2;           // 使用容量(字节)
+  uint64 free = 3;           // 空闲容量(字节)
+  double usage = 4;          // 使用率(%)
+}
+
+// 网络信息
+message NetworkInfo {
+  string ip_address = 1;     // IP地址
+  uint64 tx_bytes = 2;       // 发送字节数
+  uint64 rx_bytes = 3;       // 接收字节数
+  uint64 tx_speed = 4;       // 发送速度(字节/秒)
+  uint64 rx_speed = 5;       // 接收速度(字节/秒)
+}
+
+// 状态响应
+message StatusResponse {
+  bool success = 1;          // 是否成功
+  string message = 2;        // 消息
+}
+
+// 空消息
+message Empty {
+}
