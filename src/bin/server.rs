@@ -1,14 +1,17 @@
 use tonic::transport::{Identity, Server, ServerTlsConfig};
-use tonic::{Request, Response, Status};
+use tonic::{Request, Response, Status, Streaming};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 use std::time::Duration;
+use tokio::time::sleep;
 use std::fs::File;
 use std::io::{BufReader, Write};
 use rustls_pemfile::{certs, pkcs8_private_keys};
-use tokio_stream::wrappers::ReceiverStream;
+use rustls::{Certificate, PrivateKey, ServerConfig};
+use std::env;
+use tokio_stream::{wrappers::ReceiverStream, Stream};
 
 // 导入生成的gRPC代码
 use server_agent::server_agent_service_server::{ServerAgentService, ServerAgentServiceServer};
@@ -30,6 +33,7 @@ struct ClientState {
 }
 
 use std::collections::HashMap as SyncHashMap;
+use tokio::sync::RwLock;
 
 // 命令结果存储
 #[derive(Debug, Clone, Default)]
@@ -233,13 +237,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // 创建gRPC服务
     let server = ServerAgentServiceServer::new(server_state.clone());
+
+    // 加载TLS证书和私钥
+    let cert_file = File::open("server.pem").expect("Failed to open certificate file");
+    let key_file = File::open("server-key.pem").expect("Failed to open private key file");
     
     // 在后台启动服务器
     tokio::spawn(async move {
-        // 加载TLS证书和私钥
-        let cert_file = File::open("server.pem").expect("Failed to open certificate file");
-        let key_file = File::open("server-key.pem").expect("Failed to open private key file");
-
         let mut cert_chain = certs(&mut BufReader::new(cert_file))
             .expect("Failed to read certificate chain");
 
