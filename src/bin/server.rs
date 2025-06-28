@@ -1,16 +1,14 @@
-use tonic::transport::{Server, ServerTlsConfig};
-use tonic::{Request, Response, Status, Streaming};
+use tonic::transport::{Identity, Server, ServerTlsConfig};
+use tonic::{Request, Response, Status};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 use std::time::Duration;
-use tokio::time::sleep;
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Write};
 use rustls_pemfile::{certs, pkcs8_private_keys};
-use rustls::{Certificate, PrivateKey, ServerConfig};
-use std::env;
+use tokio_stream::wrappers::ReceiverStream;
 
 // 导入生成的gRPC代码
 use server_agent::server_agent_service_server::{ServerAgentService, ServerAgentServiceServer};
@@ -28,11 +26,10 @@ struct ClientState {
     os: String,
     version: String,
     last_status: Option<StatusReport>,
-    command_sender: Option<mpsc::Sender<CommandRequest>>,
+    command_sender: Option<mpsc::Sender<Result::<CommandRequest,Status>>>,
 }
 
 use std::collections::HashMap as SyncHashMap;
-use tokio::sync::RwLock;
 
 // 命令结果存储
 #[derive(Debug, Clone, Default)]
@@ -58,7 +55,7 @@ impl CommandResultStore {
 struct ServerState {
     clients: Mutex<HashMap<String, ClientState>>,
     token_whitelist: Vec<String>,
-    command_results: CommandResultStore,
+    command_results: Mutex<CommandResultStore>,
 }
 
 impl ServerState {
@@ -66,7 +63,7 @@ impl ServerState {
         Self {
             clients: Mutex::new(HashMap::new()),
             token_whitelist,
-            command_results: CommandResultStore::new(),
+            command_results: Mutex::new(CommandResultStore::new()),
         }
     }
     
@@ -100,21 +97,21 @@ impl ServerState {
     }
     
     // 存储命令结果
-    fn store_command_result(&mut self, command_id: String, result: CommandReply) {
-        self.command_results.store_result(command_id, result);
+    fn store_command_result(&self, command_id: String, result: CommandReply) {
+        self.command_results.lock().unwrap().store_result(command_id, result);
     }
 }
 
 #[tonic::async_trait]
 impl ServerAgentService for Arc<ServerState> {
     // 客户端连接流 - 双向流
-    type ConnectStream = mpsc::Receiver<CommandRequest>;
+    type HandshakeStream = ReceiverStream<Result<CommandRequest,Status>>;
     
-    async fn connect(
+    async fn handshake(
         &self,
         request: Request<ConnectRequest>,
-    ) -> Result<Response<Self::ConnectStream>, Status> {
-        let connect_request = request.into_inner();
+    ) -> Result<Response<Self::HandshakeStream>, Status> {
+        let connect_request: ConnectRequest = request.into_inner();
         log::info!("Connecting client: {:?}", connect_request);
         
         // 验证token
@@ -124,7 +121,7 @@ impl ServerAgentService for Arc<ServerState> {
         }
         
         // 创建命令发送通道
-        let (command_sender, command_receiver) = mpsc::channel(100);
+        let (command_sender, command_receiver) = mpsc::channel::<Result::<CommandRequest,Status>>(100);
         
         // 存储客户端状态
         let client_state = ClientState {
@@ -139,8 +136,6 @@ impl ServerAgentService for Arc<ServerState> {
         
         log::info!("Client connected successfully: {}", connect_request.client_id);
         
-        // 创建响应流
-        let response = Ok(Response::new(command_receiver));
 
         // 当连接关闭时清理客户端状态
         tokio::spawn({ 
@@ -154,7 +149,8 @@ impl ServerAgentService for Arc<ServerState> {
             }
         });
 
-        response
+        // 创建响应流
+        Ok(Response::new(ReceiverStream::new(command_receiver)))
     }
     
     // 处理客户端状态报告
@@ -182,7 +178,7 @@ impl ServerAgentService for Arc<ServerState> {
         &self,
         request: Request<CommandReply>,
     ) -> Result<Response<Empty>, Status> {
-        let command_reply = request.into_inner();
+        let command_reply: CommandReply = request.into_inner();
         log::info!("Received command response for {}: exit_code={}", command_reply.command_id, command_reply.exit_code);
         
         // 存储命令结果
@@ -244,28 +240,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let cert_file = File::open("server.pem").expect("Failed to open certificate file");
         let key_file = File::open("server-key.pem").expect("Failed to open private key file");
 
-        let cert_chain = certs(&mut BufReader::new(cert_file))
-            .expect("Failed to read certificate chain")
-            .into_iter()
-            .map(|cert| rustls::Certificate(cert))
-            .collect();
+        let mut cert_chain = certs(&mut BufReader::new(cert_file))
+            .expect("Failed to read certificate chain");
 
         let mut keys = pkcs8_private_keys(&mut BufReader::new(key_file))
-            .expect("Failed to read private key")
-            .into_iter()
-            .map(|key| rustls::PrivateKey(key))
-            .collect::<Vec<_>>();
+            .expect("Failed to read private key");
 
         if keys.is_empty() {
             panic!("No private keys found in key file");
         }
 
-        let tls_config = ServerTlsConfig::builder()
-            .identity(rustls::ServerConfig::builder()
-                .with_safe_defaults()
-                .with_no_client_auth()
-                .with_single_cert(cert_chain, keys.remove(0))
-                .expect("Failed to create server TLS configuration"))
+        let tls_config = ServerTlsConfig::new()
+            .identity(Identity::from_pem(cert_chain.remove(0), keys.remove(0)))
             .into();
 
         Server::builder()
@@ -381,11 +367,11 @@ async fn send_command(server_state: &Arc<ServerState>, client_id: &str, command:
         if let Some(sender) = &client.command_sender {
             let command_id = format!("cmd-{}", chrono::Utc::now().timestamp_millis());
             
-            let cmd_request = CommandRequest {
+            let cmd_request = Ok(CommandRequest {
                 command_id: command_id.clone(),
                 command: command.to_string(),
                 interactive: false,
-            };
+            });
             
             match sender.send(cmd_request).await {
                 Ok(_) => println!("命令已发送 (ID: {})", command_id),

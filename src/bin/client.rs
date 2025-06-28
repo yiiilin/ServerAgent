@@ -1,14 +1,16 @@
 use clap::{arg, command, Parser};
-use tonic::transport::Channel;
-use tonic::Request;
-use std::fs;
-use std::time::{Instant, Duration};
-use tokio::time::sleep;
 use futures::StreamExt;
+use network_interface::NetworkInterfaceConfig;
+use std::fs;
+use std::time::{Duration, Instant};
+use sysinfo::{CpuExt, DiskExt, NetworkExt, RefreshKind, SystemExt};
+use tokio::time::sleep;
+use tonic::transport::{Certificate, Channel, Uri};
+use tonic::Request;
 
 // 导入生成的gRPC代码
 use server_agent::server_agent_service_client::ServerAgentServiceClient;
-use server_agent::{ConnectRequest, StatusReport, Empty};
+use server_agent::{ConnectRequest, Empty, StatusReport};
 
 pub mod server_agent {
     tonic::include_proto!("server_agent");
@@ -41,21 +43,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 加载证书
     let cert = fs::read_to_string(&args.certpath)?;
-    let mut root_cert_store = rustls_pemfile::certs(&mut cert.as_bytes())?
-        .into_iter()
-        .map(|cert| rustls::Certificate(cert))
-        .collect();
-
-    // 创建TLS配置
-    let tls_config = rustls::ClientConfig::builder()
-        .with_safe_defaults()
-        .with_root_certificates(root_cert_store)
-        .with_no_client_auth();
+    let cert = Certificate::from_pem(cert);
 
     // 创建gRPC通道
-    let channel = Channel::from_static(&args.addr)
-        .tls_config(tonic::transport::ClientTlsConfig::new()
-            .rustls_client_config(tls_config))?
+    let channel = Channel::builder(args.addr.parse::<Uri>()?)
+        .tls_config(tonic::transport::ClientTlsConfig::new().ca_certificate(cert))?
         .connect()
         .await?;
 
@@ -72,11 +64,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     log::info!("Connecting to server...");
-    let mut command_stream = client.connect(connect_request).await?.into_inner();
+    let mut command_stream = client.handshake(connect_request).await?.into_inner();
     log::info!("Successfully connected to server");
 
     // 启动状态上报任务
-    let mut client_clone = client.clone();
+    let mut client_clone: ServerAgentServiceClient<Channel> = client.clone();
     let status_interval = args.status_interval;
     tokio::spawn(async move {
         loop {
@@ -92,8 +84,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match command {
             Ok(cmd) => {
                 log::info!("Received command: {:?}", cmd);
+                let cli = client.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = execute_command(cmd, client.clone()).await {
+                    let cli = cli;
+                    if let Err(e) = execute_command(cmd, cli).await {
                         log::error!("Failed to execute command: {:?}", e);
                     }
                 });
@@ -116,7 +110,9 @@ fn get_client_id() -> Result<String, Box<dyn std::error::Error>> {
 
 // 获取主机名
 fn get_hostname() -> Result<String, Box<dyn std::error::Error>> {
-    Ok(nodekit::hostname()?)
+    Ok(sysinfo::System::new()
+        .host_name()
+        .unwrap_or(String::from("hostname not found")))
 }
 
 // 获取操作系统信息
@@ -125,7 +121,9 @@ fn get_os_info() -> Result<String, Box<dyn std::error::Error>> {
 }
 
 // 上报客户端状态
-async fn report_status(client: &mut ServerAgentServiceClient<Channel>) -> Result<(), Box<dyn std::error::Error>> {
+async fn report_status(
+    client: &mut ServerAgentServiceClient<Channel>,
+) -> Result<(), Box<dyn std::error::Error>> {
     // 收集系统信息
     let hardware = collect_hardware_info()?;
     let network = collect_network_info()?;
@@ -186,7 +184,7 @@ fn collect_hardware_info() -> Result<server_agent::HardwareInfo, Box<dyn std::er
         cpu: Some(server_agent::CpuInfo {
             model: cpu_model,
             cores,
-            usage: sys.global_cpu_info().cpu_usage(),
+            usage: sys.global_cpu_info().cpu_usage().into(),
             load_avg_1: load_avg.one,
             load_avg_5: load_avg.five,
             load_avg_15: load_avg.fifteen,
@@ -210,15 +208,15 @@ fn collect_hardware_info() -> Result<server_agent::HardwareInfo, Box<dyn std::er
 fn collect_network_info() -> Result<server_agent::NetworkInfo, Box<dyn std::error::Error>> {
     // 获取IP地址
     let interfaces = network_interface::NetworkInterface::show()?;
-    let ip_address = interfaces.iter()
-        .find(|iface| iface.name != "lo" && !iface.addresses.is_empty())
-        .and_then(|iface| iface.addresses.first())
-        .map(|addr| addr.addr.to_string())
+    let ip_address = interfaces
+        .iter()
+        .find(|iface| iface.name != "lo" && !iface.addr.is_empty())
+        .and_then(|iface| iface.addr.first())
+        .map(|addr| addr.ip().to_string())
         .unwrap_or_else(|| "Unknown".to_string());
 
     // 获取网络流量信息
-    let mut sys = sysinfo::System::new_all();
-    sys.refresh_network();
+    let sys = sysinfo::System::new_with_specifics(RefreshKind::new().with_networks());
     let networks = sys.networks();
 
     let (mut tx_bytes, mut rx_bytes) = (0, 0);
@@ -239,7 +237,7 @@ fn collect_network_info() -> Result<server_agent::NetworkInfo, Box<dyn std::erro
 // 执行命令
 async fn execute_command(
     cmd: server_agent::CommandRequest,
-    mut client: ServerAgentServiceClient<Channel>
+    mut client: ServerAgentServiceClient<Channel>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     log::info!("Executing command: {}", cmd.command);
 
